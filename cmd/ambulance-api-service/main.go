@@ -1,19 +1,51 @@
 package main
 
 import (
+	"context"
 	"log"
+	"net/http"
 	"os"
 	"strings"
-
-	"context"
 	"time"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/technologize/otel-go-contrib/otelginmetrics"
 	"github.com/wac-fiit/ambulance-webapi-cv1/api"
 	"github.com/wac-fiit/ambulance-webapi-cv1/internal/ambulance_wl"
 	"github.com/wac-fiit/ambulance-webapi-cv1/internal/db_service"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/exporters/prometheus"
+	"go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/resource"
+	semconv "go.opentelemetry.io/otel/semconv/v1.24.0"
 )
+
+// initialize OpenTelemetry instrumentations
+func initTelemetry() error {
+	ctx := context.Background()
+	res, err := resource.New(ctx,
+		resource.WithAttributes(semconv.ServiceNameKey.String("Ambulance WebAPI Service")),
+		resource.WithAttributes(semconv.ServiceNamespaceKey.String("WAC Hospital")),
+		resource.WithSchemaURL(semconv.SchemaURL),
+		resource.WithContainer(),
+	)
+
+	if err != nil {
+		return err
+	}
+
+	metricExporter, err := prometheus.New()
+	if err != nil {
+		return err
+	}
+
+	metricProvider := metric.NewMeterProvider(metric.WithReader(metricExporter), metric.WithResource(res))
+	otel.SetMeterProvider(metricProvider)
+	return nil
+}
 
 func main() {
 	log.Printf("Server started")
@@ -27,6 +59,17 @@ func main() {
 	}
 	engine := gin.New()
 	engine.Use(gin.Recovery())
+
+	// setup telemetry
+	initTelemetry()
+	engine.Use(otelginmetrics.Middleware(
+		"Ambulance WebAPI Service",
+		// Custom attributes
+		otelginmetrics.WithAttributes(func(serverName, route string, request *http.Request) []attribute.KeyValue {
+			return append(otelginmetrics.DefaultAttributes(serverName, route, request))
+		}),
+	))
+
 	corsMiddleware := cors.New(cors.Config{
 		AllowOrigins:     []string{"*"},
 		AllowMethods:     []string{"GET", "PUT", "POST", "DELETE", "PATCH"},
@@ -47,5 +90,12 @@ func main() {
 	// request routings
 	ambulance_wl.AddRoutes(engine)
 	engine.GET("/openapi", api.HandleOpenApi)
+
+	// metrics endpoint
+	promhandler := promhttp.Handler()
+	engine.Any("/metrics", func(ctx *gin.Context) {
+		promhandler.ServeHTTP(ctx.Writer, ctx.Request)
+	})
+
 	engine.Run(":" + port)
 }
